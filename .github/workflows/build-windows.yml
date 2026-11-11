@@ -1,0 +1,30 @@
+name: Build Windows executable
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright pyinstaller
+      - name: Build portable executable
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name CAFacil app.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CAFacil-Windows-x64
+          path: dist/CAFacil.exe
+          if-no-files-found: error
+          retention-days: 30
