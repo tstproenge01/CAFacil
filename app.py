@@ -89,11 +89,30 @@ def query_ca(ca, force_update, log):
             else:
                 status = "CONSULTADO — validade não identificada"
 
-            visual = page.get_by_text(re.compile(r"Visualizar\s+CA", re.I))
+            # O CAEPI exibe primeiro uma grade; é necessário abrir o detalhe do registro.
+            detail = page.locator(
+                "img[title*='Detalhar' i], input[title*='Detalhar' i], "
+                "a[title*='Detalhar' i], [alt*='Detalhar' i]"
+            )
+            if not detail.count():
+                detail = page.get_by_text(re.compile(r"^Detalhar$", re.I))
+            if detail.count():
+                detail.first.click()
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(900)
+
+            # Na tela de detalhe, o certificado é aberto pelo botão Visualizar CA.
+            visual = page.locator(
+                "input[value*='Visualizar CA' i], button:has-text('Visualizar CA'), "
+                "a:has-text('Visualizar CA'), [title*='Visualizar CA' i]"
+            )
             if not visual.count():
-                visual = page.locator("a").filter(has_text=re.compile(r"Visualizar\s+CA", re.I))
+                visual = page.get_by_text(re.compile(r"Visualizar\\s+CA", re.I))
             if not visual.count():
-                return f"CA {ca}: {status}. Resultado localizado, mas o link Visualizar CA não apareceu."
+                return f"CA {ca}: {status}. Abri o resultado, mas o botão Visualizar CA não apareceu."
 
             cert_page = None
             try:
@@ -101,7 +120,6 @@ def query_ca(ca, force_update, log):
                     visual.first.click()
                 cert_page = popup_info.value
             except Exception:
-                # Alguns navegadores/versões abrem o relatório na própria aba.
                 visual.first.click()
                 cert_page = page
 
