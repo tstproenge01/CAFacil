@@ -1,4 +1,4 @@
-name: Build Windows executable
+name: Build CertiFacil for Windows
 
 on:
   workflow_dispatch:
@@ -16,15 +16,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install playwright pyinstaller
+          pip install playwright pyinstaller pyinstaller-hooks-contrib
       - name: Build portable executable
-        run: pyinstaller --noconfirm --clean --onefile --windowed --name CAFacil app.py
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --collect-all playwright --collect-all greenlet --collect-all pyee
+          --name CertiFacil app.py
+      - name: Verify executable
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist/CertiFacil.exe")) { throw "Executável não foi criado." }
+          $size = (Get-Item "dist/CertiFacil.exe").Length
+          if ($size -lt 10000000) { throw "Executável inesperadamente pequeno: $size bytes" }
+          Write-Host "Executável criado: $size bytes"
       - uses: actions/upload-artifact@v4
         with:
-          name: CAFacil-Windows-x64
-          path: dist/CAFacil.exe
+          name: CertiFacil-Windows-x64
+          path: dist/CertiFacil.exe
           if-no-files-found: error
           retention-days: 30
