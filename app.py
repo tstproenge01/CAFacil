@@ -12,7 +12,7 @@ import customtkinter as ctk
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 PORTAL_URL = "https://caepi.trabalho.gov.br/internet/ConsultaCAInternet.aspx"
-APP_VERSION = "2026.11.13-r2"
+APP_VERSION = "2026.11.13-r3"
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -370,17 +370,32 @@ class CADownloaderFixed:
                 pass
             cert_page.wait_for_timeout(1500)
 
-            # Se o portal responder diretamente com application/pdf, salva o corpo original.
-            if response is not None:
-                try:
-                    if "application/pdf" in response.headers.get("content-type", "").lower():
-                        data = response.body()
-                        if data.startswith(b"%PDF") and len(data) > 2000:
-                            pdf_path.write_bytes(data)
-                            self.log_status(f"✅ CA {ca_numero} baixado com sucesso ({pdf_path.stat().st_size / 1024:.2f} KB).")
-                            return
-                except Exception:
-                    pass
+            # Não transformar uma página de erro do servidor em um PDF aparentemente válido.
+            try:
+                final_url = cert_page.url or ""
+                page_title = cert_page.title()
+                page_text = cert_page.locator("body").inner_text(timeout=5000)
+            except Exception:
+                final_url = cert_page.url or ""
+                page_title = ""
+                page_text = ""
+
+            error_markers = (
+                "ERR_EMPTY_RESPONSE",
+                "ERR_CONNECTION",
+                "This site can't be reached",
+                "This page isn’t working",
+                "This page isn't working",
+            )
+            if final_url.startswith("chrome-error://") or any(
+                marker.lower() in (page_title + " " + page_text).lower()
+                for marker in error_markers
+            ):
+                raise RuntimeError(
+                    "O portal encontrou o CA, mas o servidor de impressão do certificado "
+                    f"não respondeu. Endereço: {final_url or 'não informado'}. "
+                    "Aguarde o serviço oficial voltar e tente novamente."
+                )
 
             # A página de impressão do CAEPI é HTML; imprime a visualização para PDF.
             cert_page.pdf(path=str(pdf_path), format="A4", print_background=True)
