@@ -12,6 +12,7 @@ import customtkinter as ctk
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 PORTAL_URL = "https://caepi.trabalho.gov.br/internet/ConsultaCAInternet.aspx"
+APP_VERSION = "2026.11.13-r2"
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -107,7 +108,7 @@ class CADownloaderFixed:
                      font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=15, pady=(10, 5))
         self.status_text = ctk.CTkTextbox(status_frame, height=150, font=ctk.CTkFont(size=11))
         self.status_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        self.log_status("CertiFácil pronto. Adicione um ou mais números de CA.")
+        self.log_status(f"CertiFácil {APP_VERSION} pronto. Adicione um ou mais números de CA.")
 
     def process_ui_queue(self):
         try:
@@ -230,35 +231,52 @@ class CADownloaderFixed:
         try:
             page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=60000)
 
-            # O CAEPI usa ASP.NET WebForms e gera IDs GUID dinâmicos.
-            # O name do campo é estável; usar correspondência parcial e fallback pelo rótulo.
-            campo = page.locator('input[name*="txtNumeroCA"]')
-            try:
-                campo.first.wait_for(state="visible", timeout=20000)
-            except PlaywrightTimeoutError:
-                campo = page.locator('input[type="text"]').filter(
-                    has=page.get_by_text("Nº do CA:", exact=False)
-                )
-            if campo.count() == 0:
-                # Fallback acessível: localizar o input associado ao texto/label do CA.
-                labels = page.get_by_text("Nº do CA:", exact=False)
-                if labels.count():
-                    campo = page.locator('input[type="text"]')
-            if campo.count() == 0:
-                raise RuntimeError("Portal carregado, mas o campo Nº do CA não apareceu. "
-                                   "URL: " + page.url)
-            campo = campo.first
-            campo.wait_for(state="visible", timeout=15000)
-            campo.fill(str(ca_numero))
+            # Seletores confirmados na página oficial em 13/11/2026.
+            # ASP.NET WebForms usa "_" no id renderizado e "$" no atributo name.
+            campo = None
+            for selector in (
+                "#ctl00_PlaceHolderConteudo_txtNumeroCA",
+                'input[name="ctl00$PlaceHolderConteudo$txtNumeroCA"]',
+                'input[id$="txtNumeroCA"]',
+                'input[name$="txtNumeroCA"]',
+            ):
+                candidate = page.locator(selector)
+                try:
+                    candidate.first.wait_for(state="visible", timeout=8000)
+                    if candidate.count() > 0 and candidate.first.is_visible():
+                        campo = candidate.first
+                        break
+                except PlaywrightTimeoutError:
+                    continue
 
-            # O botão atual é input com value=Consultar e também recebe ID dinâmico.
-            consultar = page.locator('input[value="Consultar"], button:has-text("Consultar")')
+            # Último fallback: o formulário oficial possui um único campo de texto para o CA.
+            if campo is None:
+                text_inputs = page.locator('form input[type="text"]:visible')
+                if text_inputs.count() == 1:
+                    campo = text_inputs.first
+
+            if campo is None:
+                inputs = page.locator("form input").evaluate_all(
+                    "(els) => els.map(e => ({type:e.type,id:e.id,name:e.name,value:e.value}))"
+                )
+                raise RuntimeError(
+                    "Não localizei o campo Nº do CA na página oficial. "
+                    f"URL: {page.url}. Campos encontrados: {inputs}"
+                )
+
+            campo.fill(str(ca_numero))
+            if (campo.input_value() or "").strip() != str(ca_numero):
+                raise RuntimeError("O número do CA não permaneceu preenchido no formulário.")
+
+            # Botão oficial confirmado: input type=button com id fixo.
+            consultar = page.locator("#ctl00_PlaceHolderConteudo_btnConsultar")
             if consultar.count() == 0:
-                consultar = page.locator('input[type="button"], input[type="submit"]').filter(
-                    has_text="Consultar"
+                consultar = page.locator(
+                    'input[name="ctl00$PlaceHolderConteudo$btnConsultar"], '
+                    'input[type="button"][value="Consultar"]'
                 )
             if consultar.count() == 0:
-                raise RuntimeError("Número preenchido, mas o botão Consultar não apareceu.")
+                raise RuntimeError("Campo preenchido, mas o botão oficial Consultar não foi localizado.")
             consultar.first.click()
             try:
                 page.wait_for_load_state("networkidle", timeout=15000)
