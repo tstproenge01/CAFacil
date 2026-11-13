@@ -1,217 +1,389 @@
-import os, re, sys, threading, subprocess, queue
-from pathlib import Path
+import os
+import re
+import sys
+import threading
+import queue
+import asyncio
 from datetime import datetime
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from pathlib import Path
+from tkinter import filedialog, messagebox
 
-PORTAL = "https://caepi.trabalho.gov.br/internet/ConsultaCAInternet.aspx"
-OUT_DIR = Path.home() / "Documents" / "Certificados CA"
+import customtkinter as ctk
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-def safe_name(value):
-    return re.sub(r"[^0-9A-Za-z_-]+", "_", value).strip("_") or "CA"
+PORTAL_URL = "https://caepi.trabalho.gov.br/internet/ConsultaCAInternet.aspx"
 
-def launch_edge(playwright):
-    # Usa o Microsoft Edge instalado no Windows; não baixa Chromium.
-    try:
-        return playwright.chromium.launch(channel="msedge", headless=True)
-    except Exception as exc:
-        raise RuntimeError(
-            "Não consegui iniciar o Microsoft Edge. Verifique se ele está instalado e atualizado. "
-            "Detalhe: " + str(exc)
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+
+def safe_filename(value):
+    return re.sub(r"[^0-9A-Za-z_-]+", "_", str(value)).strip("_") or "CA"
+
+
+class CADownloaderFixed:
+    def __init__(self):
+        self.root = ctk.CTk()
+        self.root.title("CertiFácil")
+        self.root.geometry("900x700")
+        self.root.minsize(600, 500)
+
+        self.download_path = ctk.StringVar(value=str(Path.cwd() / "downloads"))
+        self.ca_list = []
+        self.is_downloading = False
+        self.ui_queue = queue.Queue()
+
+        self.setup_ui()
+        self.process_ui_queue()
+
+    def setup_ui(self):
+        self.main_canvas = ctk.CTkScrollableFrame(self.root)
+        self.main_canvas.pack(fill="both", expand=True, padx=10, pady=10)
+        main = self.main_canvas
+
+        ctk.CTkLabel(main, text="CertiFácil",
+                     font=ctk.CTkFont(size=28, weight="bold")).pack(pady=(20, 10))
+        ctk.CTkLabel(
+            main,
+            text="Praticidade e agilidade para baixar seus Certificados de Aprovação (CA)",
+            font=ctk.CTkFont(size=14)
+        ).pack(pady=(0, 20))
+
+        ca_frame = ctk.CTkFrame(main)
+        ca_frame.pack(fill="x", pady=(0, 20))
+        ctk.CTkLabel(ca_frame, text="Números dos CAs:",
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=20, pady=(20, 5))
+
+        input_frame = ctk.CTkFrame(ca_frame)
+        input_frame.pack(fill="x", padx=20, pady=(0, 10))
+        self.ca_entry = ctk.CTkEntry(
+            input_frame,
+            placeholder_text="Digite o número do CA e pressione Enter",
+            font=ctk.CTkFont(size=14), height=40
         )
+        self.ca_entry.pack(side="left", fill="x", expand=True, padx=(10, 5), pady=10)
+        self.ca_entry.bind("<Return>", self.add_ca)
+        ctk.CTkButton(input_frame, text="Adicionar", command=self.add_ca,
+                      width=100, height=40).pack(side="right", padx=(5, 10), pady=10)
 
-def locate_ca_field(page):
-    # Primeiro tenta o rótulo visível; depois usa o campo de texto da página oficial.
-    candidates = [
-        page.get_by_label(re.compile(r"N.? do CA", re.I)),
-        page.locator("input[type='text']"),
-    ]
-    for locator in candidates:
-        try:
-            if locator.count():
-                return locator.first
-        except Exception:
-            pass
-    raise RuntimeError("Não encontrei o campo 'Nº do CA' no portal. O site pode ter mudado.")
+        list_frame = ctk.CTkFrame(ca_frame)
+        list_frame.pack(fill="x", padx=20, pady=(0, 15))
+        ctk.CTkLabel(list_frame, text="CAs na lista:",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=10, pady=(10, 5))
+        self.ca_list_frame = ctk.CTkFrame(list_frame, fg_color="transparent")
+        self.ca_list_frame.pack(fill="x", padx=10, pady=(0, 5))
+        ctk.CTkButton(
+            list_frame, text="Limpar Lista", command=self.clear_ca_list,
+            fg_color="transparent", border_width=2, text_color=("gray10", "#DCE4EE"),
+            width=120, height=30
+        ).pack(anchor="e", padx=10, pady=(5, 10))
 
-def click_consult(page):
-    for locator in [
-        page.get_by_role("button", name=re.compile(r"Consultar", re.I)),
-        page.get_by_role("input", name=re.compile(r"Consultar", re.I)),
-        page.locator("input[type='submit'][value*='Consultar' i]"),
-        page.get_by_text(re.compile(r"^Consultar$", re.I)),
-    ]:
-        try:
-            if locator.count():
-                locator.first.click(timeout=10000)
-                return
-        except Exception:
-            continue
-    raise RuntimeError("Não encontrei o botão Consultar no portal.")
+        path_frame = ctk.CTkFrame(main)
+        path_frame.pack(fill="x", pady=(0, 20))
+        ctk.CTkLabel(path_frame, text="Pasta de Download:",
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=20, pady=(15, 5))
+        path_input_frame = ctk.CTkFrame(path_frame)
+        path_input_frame.pack(fill="x", padx=20, pady=(0, 15))
+        self.path_entry = ctk.CTkEntry(path_input_frame, textvariable=self.download_path,
+                                       font=ctk.CTkFont(size=12), height=35)
+        self.path_entry.pack(side="left", fill="x", expand=True, padx=(10, 5), pady=10)
+        ctk.CTkButton(path_input_frame, text="Procurar", command=self.select_download_path,
+                      width=100, height=35).pack(side="right", padx=(5, 10), pady=10)
 
-def query_ca(ca, force_update, log):
-    from playwright.sync_api import sync_playwright
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    pdf_path = OUT_DIR / f"CA_{safe_name(ca)}.pdf"
-    if pdf_path.exists() and not force_update:
-        return f"CA {ca}: já existe PDF salvo; ignorado para evitar download repetido."
+        self.start_button = ctk.CTkButton(
+            main, text="Iniciar Downloads", command=self.start_downloads,
+            font=ctk.CTkFont(size=16, weight="bold"), height=50,
+            fg_color="#1f538d", hover_color="#14375e"
+        )
+        self.start_button.pack(fill="x", padx=20, pady=(0, 10))
 
-    with sync_playwright() as p:
-        browser = launch_edge(p)
-        context = browser.new_context(accept_downloads=True)
-        page = context.new_page()
-        try:
-            page.goto(PORTAL, wait_until="domcontentloaded", timeout=60000)
-            field = locate_ca_field(page)
-            field.fill(ca)
-            click_consult(page)
-            try:
-                page.wait_for_load_state("networkidle", timeout=12000)
-            except Exception:
-                pass
-            page.wait_for_timeout(1200)
-            body = page.locator("body").inner_text(timeout=15000)
+        self.progress_bar = ctk.CTkProgressBar(main, height=12)
+        self.progress_bar.pack(fill="x", padx=20, pady=(0, 15))
+        self.progress_bar.set(0)
 
-            # Exige que o número consultado apareça como número de CA no resultado.
-            exact_ca = re.search(r"(?:N[ºo.]?\s*)?CA\s*[:#-]?\s*" + re.escape(ca) + r"\b", body, re.I)
-            if not exact_ca and not re.search(r"\b" + re.escape(ca) + r"\b", body):
-                return f"CA {ca}: não localizado no portal oficial."
+        status_frame = ctk.CTkFrame(main)
+        status_frame.pack(fill="both", expand=True, pady=(0, 10))
+        ctk.CTkLabel(status_frame, text="Status:",
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=15, pady=(10, 5))
+        self.status_text = ctk.CTkTextbox(status_frame, height=150, font=ctk.CTkFont(size=11))
+        self.status_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.log_status("CertiFácil pronto. Adicione um ou mais números de CA.")
 
-            validity = re.search(r"Validade\s*:?\s*(\d{2}/\d{2}/\d{4})", body, re.I)
-            if validity:
-                try:
-                    date_value = datetime.strptime(validity.group(1), "%d/%m/%Y").date()
-                    status = "VENCIDO" if date_value < datetime.now().date() else "DENTRO DA VALIDADE"
-                except ValueError:
-                    status = "CONSULTADO — confira a validade no certificado"
-            elif re.search(r"VENCID[OA]", body, re.I):
-                status = "VENCIDO"
-            else:
-                status = "CONSULTADO — validade não identificada"
-
-            # O CAEPI exibe primeiro uma grade; é necessário abrir o detalhe do registro.
-            detail = page.locator(
-                "img[title*='Detalhar' i], input[title*='Detalhar' i], "
-                "a[title*='Detalhar' i], [alt*='Detalhar' i]"
-            )
-            if not detail.count():
-                detail = page.get_by_text(re.compile(r"^Detalhar$", re.I))
-            if detail.count():
-                detail.first.click()
-                try:
-                    page.wait_for_load_state("networkidle", timeout=10000)
-                except Exception:
-                    pass
-                page.wait_for_timeout(900)
-
-            # Na tela de detalhe, o certificado é aberto pelo botão Visualizar CA.
-            visual = page.locator(
-                "input[value*='Visualizar CA' i], button:has-text('Visualizar CA'), "
-                "a:has-text('Visualizar CA'), [title*='Visualizar CA' i]"
-            )
-            if not visual.count():
-                visual = page.get_by_text(re.compile(r"Visualizar\\s+CA", re.I))
-            if not visual.count():
-                return f"CA {ca}: {status}. Abri o resultado, mas o botão Visualizar CA não apareceu."
-
-            cert_page = None
-            try:
-                with page.expect_popup(timeout=7000) as popup_info:
-                    visual.first.click()
-                cert_page = popup_info.value
-            except Exception:
-                visual.first.click()
-                cert_page = page
-
-            cert_page.wait_for_load_state("domcontentloaded", timeout=30000)
-            cert_page.wait_for_timeout(700)
-            temp_path = pdf_path.with_suffix(".tmp.pdf")
-            cert_page.pdf(path=str(temp_path), format="A4", print_background=True)
-            if not temp_path.exists() or temp_path.stat().st_size < 3000:
-                if temp_path.exists():
-                    temp_path.unlink()
-                raise RuntimeError("O portal abriu o relatório, mas o PDF gerado ficou vazio ou incompleto.")
-            temp_path.replace(pdf_path)
-            if cert_page is not page:
-                cert_page.close()
-            return f"CA {ca}: {status} — PDF salvo em {pdf_path}"
-        finally:
-            context.close()
-            browser.close()
-
-class App:
-    def __init__(self, root):
-        self.root = root
-        self.messages = queue.Queue()
-        root.title("CertiFácil — Consulta de CA")
-        root.geometry("820x600")
-        root.minsize(680, 500)
-
-        ttk.Label(root, text="CertiFácil", font=("Segoe UI", 21, "bold")).pack(anchor="w", padx=18, pady=(15, 0))
-        ttk.Label(root, text="Consulta vários Certificados de Aprovação no portal oficial do Ministério do Trabalho.").pack(anchor="w", padx=18, pady=(0, 12))
-        ttk.Label(root, text="Digite ou cole os números de CA (um por linha, espaço ou vírgula):").pack(anchor="w", padx=18)
-        self.input = tk.Text(root, height=7, font=("Consolas", 11), wrap="word")
-        self.input.pack(fill="x", padx=18, pady=6)
-
-        controls = ttk.Frame(root)
-        controls.pack(fill="x", padx=18, pady=5)
-        self.btn = ttk.Button(controls, text="Consultar e salvar certificados", command=self.start)
-        self.btn.pack(side="left")
-        ttk.Button(controls, text="Abrir pasta dos PDFs", command=self.open_folder).pack(side="left", padx=8)
-        self.force_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(controls, text="Atualizar PDFs que já existem", variable=self.force_var).pack(side="left", padx=8)
-
-        self.path_label = ttk.Label(root, text=f"Destino: {OUT_DIR}")
-        self.path_label.pack(anchor="w", padx=18, pady=5)
-        ttk.Label(root, text="Andamento e resultados:").pack(anchor="w", padx=18, pady=(8, 0))
-        self.logbox = tk.Text(root, height=15, state="disabled", font=("Segoe UI", 9), wrap="word")
-        self.logbox.pack(fill="both", expand=True, padx=18, pady=(4, 14))
-        self.log("Pronto. O programa utilizará o Microsoft Edge instalado no computador.")
-        self.root.after(150, self.process_messages)
-
-    def log(self, message):
-        self.messages.put(message)
-
-    def process_messages(self):
+    def process_ui_queue(self):
         try:
             while True:
-                message = self.messages.get_nowait()
-                self.logbox.configure(state="normal")
-                self.logbox.insert("end", message + "\n")
-                self.logbox.see("end")
-                self.logbox.configure(state="disabled")
+                kind, value = self.ui_queue.get_nowait()
+                if kind == "log":
+                    self.status_text.insert("end", value + "\n")
+                    self.status_text.see("end")
+                elif kind == "progress":
+                    self.progress_bar.set(value)
+                elif kind == "done":
+                    self.is_downloading = False
+                    self.start_button.configure(state="normal")
         except queue.Empty:
             pass
-        self.root.after(150, self.process_messages)
+        self.root.after(100, self.process_ui_queue)
 
-    def open_folder(self):
-        OUT_DIR.mkdir(parents=True, exist_ok=True)
-        os.startfile(str(OUT_DIR))
+    def log_status(self, message):
+        self.ui_queue.put(("log", str(message)))
 
-    def start(self):
-        raw = self.input.get("1.0", "end")
-        cas = list(dict.fromkeys(re.findall(r"\d+", raw)))
-        if not cas:
-            messagebox.showwarning("CertiFácil", "Digite pelo menos um número de CA.")
+    def add_ca(self, event=None):
+        value = re.sub(r"\D", "", self.ca_entry.get().strip())
+        if not value:
             return
-        self.btn.configure(state="disabled")
-        self.log(f"Iniciando consulta de {len(cas)} CA(s)...")
-        threading.Thread(target=self.worker, args=(cas, self.force_var.get()), daemon=True).start()
+        if value in self.ca_list:
+            self.log_status(f"CA {value} já está na lista.")
+        else:
+            self.ca_list.append(value)
+            self.update_ca_list_display()
+            self.log_status(f"CA {value} adicionado à lista.")
+        self.ca_entry.delete(0, "end")
 
-    def worker(self, cas, force_update):
+    def update_ca_list_display(self):
+        for child in self.ca_list_frame.winfo_children():
+            child.destroy()
+        for ca in self.ca_list:
+            item = ctk.CTkFrame(self.ca_list_frame)
+            item.pack(fill="x", pady=2)
+            ctk.CTkLabel(item, text=f"CA {ca}", anchor="w",
+                         font=ctk.CTkFont(size=13)).pack(side="left", padx=10, pady=5)
+            ctk.CTkButton(item, text="Remover", width=80, height=26,
+                          fg_color="#8b3030", hover_color="#6d2424",
+                          command=lambda n=ca: self.remove_ca(n)).pack(side="right", padx=8, pady=4)
+
+    def remove_ca(self, ca):
+        if ca in self.ca_list:
+            self.ca_list.remove(ca)
+            self.update_ca_list_display()
+
+    def clear_ca_list(self):
+        self.ca_list.clear()
+        self.update_ca_list_display()
+
+    def select_download_path(self):
+        selected = filedialog.askdirectory()
+        if selected:
+            self.download_path.set(selected)
+
+    def start_downloads(self):
+        if self.is_downloading:
+            return
+        if not self.ca_list:
+            messagebox.showwarning("CertiFácil", "Adicione pelo menos um número de CA à lista.")
+            return
+        folder = self.download_path.get().strip()
+        if not folder:
+            messagebox.showwarning("CertiFácil", "Selecione a pasta de download.")
+            return
+        self.is_downloading = True
+        self.start_button.configure(state="disabled")
+        self.progress_bar.set(0)
+        cas = list(self.ca_list)
+        threading.Thread(target=self.run_downloads, args=(cas, folder), daemon=True).start()
+
+    def run_downloads(self, cas, folder):
         try:
-            for ca in cas:
-                self.log(f"Consultando CA {ca}...")
+            os.makedirs(folder, exist_ok=True)
+            with sync_playwright() as p:
+                browser = self.launch_browser(p)
+                context = browser.new_context(accept_downloads=True)
                 try:
-                    result = query_ca(ca, force_update, self.log)
-                except Exception as exc:
-                    result = f"CA {ca}: ERRO — {exc}"
-                self.log(result)
+                    for index, ca in enumerate(cas, 1):
+                        try:
+                            self.baixar_ca_individual(context, ca, folder)
+                        except Exception as exc:
+                            self.log_status(f"❌ CA {ca}: {exc}")
+                        self.ui_queue.put(("progress", index / len(cas)))
+                finally:
+                    context.close()
+                    browser.close()
+            self.log_status("Processo concluído.")
+        except Exception as exc:
+            self.log_status(f"Erro geral: {exc}")
         finally:
-            self.log("Processo concluído.")
-            self.root.after(0, lambda: self.btn.configure(state="normal"))
+            self.ui_queue.put(("done", None))
+
+    def launch_browser(self, playwright):
+        # Usa o Edge instalado no Windows, sem exigir instalação separada do Python.
+        try:
+            return playwright.chromium.launch(channel="msedge", headless=True)
+        except Exception as exc:
+            raise RuntimeError(
+                "Não foi possível iniciar o Microsoft Edge. Confirme que ele está instalado. "
+                f"Detalhe: {exc}"
+            )
+
+    def _first_visible(self, page, selectors):
+        for selector in selectors:
+            loc = page.locator(selector)
+            try:
+                if loc.count() and loc.first.is_visible():
+                    return loc.first
+            except Exception:
+                continue
+        return None
+
+    def baixar_ca_individual(self, context, ca_numero, download_path):
+        self.log_status(f"Iniciando processo para o CA: {ca_numero}")
+        page = context.new_page()
+        try:
+            page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(700)
+
+            # O CAEPI atual é ASP.NET WebForms. O atributo name contém o ID
+            # completo com PlaceHolderConteudo; não usar o antigo #txtNumeroCA.
+            campo = self._first_visible(page, [
+                'input[name="ctl00$PlaceHolderConteudo$txtNumeroCA"]',
+                'input[id$="_txtNumeroCA"]',
+                'input[id$="txtNumeroCA"]',
+                '#txtNumeroCA'
+            ])
+            if campo is None:
+                raise RuntimeError("O portal abriu, mas o campo oficial Nº do CA não foi localizado.")
+            campo.fill(str(ca_numero))
+
+            consultar = self._first_visible(page, [
+                'input[name="ctl00$PlaceHolderConteudo$btnConsultar"]',
+                'input[id$="_btnConsultar"]',
+                '#btnConsultar',
+                'input[type="submit"][value*="Consultar"]'
+            ])
+            if consultar is None:
+                raise RuntimeError("O campo foi preenchido, mas o botão Consultar não foi localizado.")
+            consultar.click()
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except PlaywrightTimeoutError:
+                pass
+            page.wait_for_timeout(900)
+
+            body = page.locator("body").inner_text(timeout=15000)
+            if re.search(r"nenhum CA cadastrado|não foi encontrado|nao foi encontrado|nenhum registro", body, re.I):
+                self.log_status(f"CA {ca_numero} não encontrado no cadastro oficial.")
+                return
+
+            detalhe = self._first_visible(page, [
+                '#PlaceHolderConteudo_grdListaResultado_btnDetalhar_0',
+                'input[id*="grdListaResultado"][id*="btnDetalhar"]',
+                'a[id*="grdListaResultado"][id*="Detalhar"]',
+                'input[title*="Detalhar"]',
+                'img[alt*="Detalhar"]',
+                'a[title*="Detalhar"]'
+            ])
+            if detalhe is None:
+                # Procura controles de detalhe pelo texto/atributos no resultado atual.
+                detalhe = self._first_visible(page, [
+                    'input[value*="Detalhar"]',
+                    'button:has-text("Detalhar")',
+                    'a:has-text("Detalhar")'
+                ])
+            if detalhe is None:
+                # Um resultado pode existir sem ação de detalhe; não gerar PDF de uma página errada.
+                raise RuntimeError("A consulta foi enviada, mas não apareceu um resultado com a ação Detalhar. "
+                                   "Confira se o CA existe no portal.")
+            detalhe.click()
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except PlaywrightTimeoutError:
+                pass
+            page.wait_for_timeout(700)
+
+            validade = ""
+            for selector in [
+                '#PlaceHolderConteudo_lblDTValidade',
+                '[id$="lblDTValidade"]',
+                'span[id*="DTValidade"]'
+            ]:
+                try:
+                    if page.locator(selector).count():
+                        validade = page.locator(selector).first.inner_text().strip()
+                        break
+                except Exception:
+                    pass
+            status = ""
+            match = re.search(r"\d{2}/\d{2}/\d{4}", validade)
+            if match:
+                try:
+                    data = datetime.strptime(match.group(), "%d/%m/%Y").date()
+                    status = " (Vencido)" if data < datetime.now().date() else " (Vigente)"
+                except ValueError:
+                    pass
+            self.log_status(f"CA {ca_numero} encontrado{status}.")
+
+            visualizar = self._first_visible(page, [
+                'input[name="ctl00$PlaceHolderConteudo$btnVisualizarCA"]',
+                'input[id$="_btnVisualizarCA"]',
+                '#PlaceHolderConteudo_btnVisualizarCA',
+                'input[value*="Visualizar CA"]',
+                'button:has-text("Visualizar CA")',
+                'a:has-text("Visualizar CA")'
+            ])
+            if visualizar is None:
+                raise RuntimeError("O detalhe foi aberto, mas o botão Visualizar CA não apareceu.")
+
+            pdf_path = Path(download_path) / f"CA_{safe_filename(ca_numero)}{status.replace(' ', '')}.pdf"
+            if pdf_path.exists():
+                pdf_path = Path(download_path) / f"CA_{safe_filename(ca_numero)}_{datetime.now():%Y%m%d_%H%M%S}.pdf"
+
+            cert_page = None
+            response = None
+            try:
+                with page.expect_popup(timeout=8000) as popup_info:
+                    visualizar.click()
+                cert_page = popup_info.value
+            except PlaywrightTimeoutError:
+                # Alguns registros abrem a visualização na mesma aba.
+                with page.expect_response(
+                    lambda r: "ImprimirCAP" in r.url or "VisualizarCA" in r.url,
+                    timeout=5000
+                ) as response_info:
+                    try:
+                        visualizar.click()
+                    except Exception:
+                        pass
+                response = response_info.value
+                cert_page = page
+
+            if cert_page is None:
+                cert_page = page
+            try:
+                cert_page.wait_for_load_state("domcontentloaded", timeout=20000)
+            except PlaywrightTimeoutError:
+                pass
+            cert_page.wait_for_timeout(1500)
+
+            # Se o portal responder diretamente com application/pdf, salva o corpo original.
+            if response is not None:
+                try:
+                    if "application/pdf" in response.headers.get("content-type", "").lower():
+                        data = response.body()
+                        if data.startswith(b"%PDF") and len(data) > 2000:
+                            pdf_path.write_bytes(data)
+                            self.log_status(f"✅ CA {ca_numero} baixado com sucesso ({pdf_path.stat().st_size / 1024:.2f} KB).")
+                            return
+                except Exception:
+                    pass
+
+            # A página de impressão do CAEPI é HTML; imprime a visualização para PDF.
+            cert_page.pdf(path=str(pdf_path), format="A4", print_background=True)
+            if not pdf_path.exists() or pdf_path.stat().st_size < 2000:
+                if pdf_path.exists():
+                    pdf_path.unlink()
+                raise RuntimeError("O arquivo PDF ficou vazio ou incompleto.")
+            self.log_status(f"✅ CA {ca_numero} baixado com sucesso ({pdf_path.stat().st_size / 1024:.2f} KB).")
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    def run(self):
+        self.root.mainloop()
+
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    app = CADownloaderFixed()
+    app.run()
