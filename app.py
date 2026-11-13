@@ -333,16 +333,7 @@ class CADownloaderFixed:
                     visualizar.click()
                 cert_page = popup_info.value
             except PlaywrightTimeoutError:
-                # Alguns registros abrem a visualização na mesma aba.
-                with page.expect_response(
-                    lambda r: "ImprimirCAP" in r.url or "VisualizarCA" in r.url,
-                    timeout=5000
-                ) as response_info:
-                    try:
-                        visualizar.click()
-                    except Exception:
-                        pass
-                response = response_info.value
+                # O clique pode ter navegado na própria aba, sem abrir popup.
                 cert_page = page
 
             if cert_page is None:
