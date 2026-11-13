@@ -19,11 +19,12 @@ jobs:
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install playwright pyinstaller pyinstaller-hooks-contrib
+          pip install customtkinter playwright pyinstaller pyinstaller-hooks-contrib
       - name: Build portable executable
         run: >
           pyinstaller --noconfirm --clean --onefile --windowed
-          --collect-all playwright --collect-all greenlet --collect-all pyee
+          --collect-all customtkinter --collect-all playwright
+          --collect-all greenlet --collect-all pyee
           --name CertiFacil app.py
       - name: Verify executable
         shell: pwsh
