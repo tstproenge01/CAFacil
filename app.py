@@ -229,29 +229,37 @@ class CADownloaderFixed:
         page = context.new_page()
         try:
             page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(700)
 
-            # O CAEPI atual é ASP.NET WebForms. O atributo name contém o ID
-            # completo com PlaceHolderConteudo; não usar o antigo #txtNumeroCA.
-            campo = self._first_visible(page, [
-                'input[name="ctl00$PlaceHolderConteudo$txtNumeroCA"]',
-                'input[id$="_txtNumeroCA"]',
-                'input[id$="txtNumeroCA"]',
-                '#txtNumeroCA'
-            ])
-            if campo is None:
-                raise RuntimeError("O portal abriu, mas o campo oficial Nº do CA não foi localizado.")
+            # O CAEPI usa ASP.NET WebForms e gera IDs GUID dinâmicos.
+            # O name do campo é estável; usar correspondência parcial e fallback pelo rótulo.
+            campo = page.locator('input[name*="txtNumeroCA"]')
+            try:
+                campo.first.wait_for(state="visible", timeout=20000)
+            except PlaywrightTimeoutError:
+                campo = page.locator('input[type="text"]').filter(
+                    has=page.get_by_text("Nº do CA:", exact=False)
+                )
+            if campo.count() == 0:
+                # Fallback acessível: localizar o input associado ao texto/label do CA.
+                labels = page.get_by_text("Nº do CA:", exact=False)
+                if labels.count():
+                    campo = page.locator('input[type="text"]')
+            if campo.count() == 0:
+                raise RuntimeError("Portal carregado, mas o campo Nº do CA não apareceu. "
+                                   "URL: " + page.url)
+            campo = campo.first
+            campo.wait_for(state="visible", timeout=15000)
             campo.fill(str(ca_numero))
 
-            consultar = self._first_visible(page, [
-                'input[name="ctl00$PlaceHolderConteudo$btnConsultar"]',
-                'input[id$="_btnConsultar"]',
-                '#btnConsultar',
-                'input[type="submit"][value*="Consultar"]'
-            ])
-            if consultar is None:
-                raise RuntimeError("O campo foi preenchido, mas o botão Consultar não foi localizado.")
-            consultar.click()
+            # O botão atual é input com value=Consultar e também recebe ID dinâmico.
+            consultar = page.locator('input[value="Consultar"], button:has-text("Consultar")')
+            if consultar.count() == 0:
+                consultar = page.locator('input[type="button"], input[type="submit"]').filter(
+                    has_text="Consultar"
+                )
+            if consultar.count() == 0:
+                raise RuntimeError("Número preenchido, mas o botão Consultar não apareceu.")
+            consultar.first.click()
             try:
                 page.wait_for_load_state("networkidle", timeout=15000)
             except PlaywrightTimeoutError:
